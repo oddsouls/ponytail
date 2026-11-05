@@ -95,6 +95,19 @@ Kilo Code is built on OpenCode and runs the same plugin through its `plugin` key
 
 OpenCode 1 has no `plugin add` and uses the older `plugin` key: `{ "plugin": ["@dietrichgebert/ponytail"] }`, or from a checkout the file path: `{ "plugin": ["./.opencode/plugins/ponytail.mjs"] }`.
 
+### Android / Termux: OpenCode with free-API failover
+
+The optional [`termux/`](termux/) profile installs Ubuntu via `proot-distro`, OpenCode and Ponytail, then exposes one local OpenAI-compatible model (`ponytail-free/free`). A loopback-only gateway rotates healthy free routes and keeps upstream API keys outside the Ubuntu container.
+
+```bash
+bash termux/install.sh
+ptmobile key gemini       # or groq / openrouter
+ptmobile status
+ptmobile init myproject
+```
+
+See [`termux/README.md`](termux/README.md) for provider assumptions, zero-spend caveats, routing rules and commands.
+
 ## Gemini CLI
 
 ```bash
