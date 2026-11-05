@@ -167,6 +167,8 @@ Then open `/hooks` in Codex, trust its two lifecycle hooks, and start a new thre
 
 **Any other agent:** copy [`AGENTS.md`](AGENTS.md) into your project, or ask your agent to install [`skills/ponytail/SKILL.md`](skills/ponytail/SKILL.md) as a skill. Step by step for Copilot, Cursor, OpenCode, Gemini and the rest: **[INSTALL.md](INSTALL.md)**.
 
+**Android / Termux:** [`termux/`](termux/) adds a phone-first OpenCode profile with a localhost free-API gateway. OpenCode still sees one model (`ponytail-free/free`); the gateway handles provider health and failover without changing the Ponytail ruleset.
+
 That was it. He'd be proud. He won't say it.
 
 Active every session, with a handful of commands (see [Commands](#commands)). `/ponytail ultra` exists for when the codebase has wronged you personally. Startup and mode-change text shows the current mode.
