@@ -1,0 +1,282 @@
+#!/data/data/com.termux/files/usr/bin/bash
+set -euo pipefail
+
+ROOT="${PONYTAIL_MOBILE_ROOT:-$HOME/.local/share/ponytail-mobile}"
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ponytail"
+CFG_FILE="$CFG_DIR/mobile.json"
+SECRETS_FILE="$CFG_DIR/mobile-secrets.json"
+PID_FILE="$CFG_DIR/mobile-gateway.pid"
+LOG_FILE="$CFG_DIR/mobile-gateway.log"
+PY="$ROOT/free_gateway.py"
+
+mkdir -p "$CFG_DIR"
+
+usage() {
+  cat <<'EOF'
+Ponytail Mobile — OpenCode + Ponytail + free API failover
+
+  ptmobile key gemini|groq|openrouter   securely store/update a provider key
+  ptmobile rotate-token                rotate the localhost gateway token
+  ptmobile start / stop                manage the local free-API gateway
+  ptmobile status                      healthy routes, cooldowns and rate headers
+  ptmobile discover                    refresh provider model catalogs (no generation)
+  ptmobile doctor                      check Termux, Ubuntu, OpenCode, config and gateway
+  ptmobile open [project]              open OpenCode in Ubuntu (/root/projects)
+  ptmobile init NAME                   create a git project and open it
+  ptmobile logs                        tail gateway log
+
+With no arguments, prints status and this help.
+EOF
+}
+
+need_installed() {
+  [ -x "$PY" ] || { echo "Ponytail Mobile is not installed; run termux/install.sh" >&2; exit 2; }
+}
+
+key_cmd() {
+  need_installed
+  local provider="${1:-}" var
+  case "$provider" in
+    gemini) var=GEMINI_API_KEY ;;
+    groq) var=GROQ_API_KEY ;;
+    openrouter) var=OPENROUTER_API_KEY ;;
+    *) echo "provider must be gemini, groq or openrouter" >&2; exit 2 ;;
+  esac
+  local value
+  read -r -s -p "$var: " value
+  echo
+  [ -n "$value" ] || { echo "empty key" >&2; exit 2; }
+  printf '%s' "$value" | python "$PY" set-secret --name "$var"
+  unset value
+  echo "saved $var in $SECRETS_FILE (0600)"
+}
+
+sync_token() {
+  python "$PY" token | proot-distro login ubuntu -- python3 -c '
+from pathlib import Path
+import sys
+p = Path("/root/.config/ponytail/gateway.token")
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(sys.stdin.read().strip() + "\n")
+p.chmod(0o600)
+'
+}
+
+rotate_token() {
+  need_installed
+  python - <<'PY' | python "$PY" set-secret --name gatewayToken
+import secrets
+print(secrets.token_hex(24), end="")
+PY
+  sync_token
+  stop_gateway
+  start_gateway
+  echo "localhost gateway token rotated"
+}
+
+alive() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid cmd
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  [[ "$cmd" == *"$PY"*"serve"* ]]
+}
+
+start_gateway() {
+  need_installed
+  if alive; then return 0; fi
+  rm -f "$PID_FILE"
+  python "$PY" ensure-secrets
+  nohup env PONYTAIL_GATEWAY_LOG=1 \
+    python "$PY" serve --config "$CFG_FILE" >>"$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  for _ in 1 2 3 4 5 6 7 8; do
+    if alive && python "$PY" health --config "$CFG_FILE" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "gateway failed to start; see $LOG_FILE" >&2
+  tail -n 20 "$LOG_FILE" >&2 || true
+  exit 1
+}
+
+stop_gateway() {
+  if alive; then
+    local pid
+    pid="$(cat "$PID_FILE")"
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8; do alive || break; sleep 0.2; done
+    alive && kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+}
+
+status_cmd() {
+  start_gateway
+  python "$PY" health --config "$CFG_FILE" | python -c '
+import json, sys
+data = json.load(sys.stdin)
+print("gateway: OK" if data.get("ok") else "gateway: no usable route")
+for r in data.get("routes", []):
+    cd = int(r.get("cooldownSec") or 0)
+    if cd:
+        state = "cooldown %dm%02ds (%s)" % (cd // 60, cd % 60, r.get("reason") or "?")
+    else:
+        state = "ok=%s fail=%s avg=%sms" % (r.get("ok"), r.get("fail"), r.get("avgMs") or "-")
+    rate = r.get("rate") or {}
+    rem = rate.get("x-ratelimit-remaining-requests")
+    lim = rate.get("x-ratelimit-limit-requests")
+    reset = rate.get("x-ratelimit-reset-requests")
+    if rem is not None:
+        state += " req=%s%s" % (rem, "/" + lim if lim else "")
+    if reset:
+        state += " reset=" + reset
+    print("  %-52s %s" % (r.get("route"), state))
+if data.get("missingKeys"):
+    print("missing keys: " + ", ".join(data["missingKeys"]))
+'
+}
+
+run_gateway_cmd() {
+  need_installed
+  python "$PY" "$1" --config "$CFG_FILE"
+}
+
+check_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "project name: letters, digits, . _ - only" >&2; exit 2; }
+}
+
+with_wakelock() {
+  local held=0 rc=0
+  if command -v termux-wake-lock >/dev/null 2>&1; then
+    termux-wake-lock >/dev/null 2>&1 || true
+    held=1
+  fi
+  set +e
+  "$@"
+  rc=$?
+  set -e
+  if [ "$held" = 1 ] && command -v termux-wake-unlock >/dev/null 2>&1; then
+    termux-wake-unlock >/dev/null 2>&1 || true
+  fi
+  return "$rc"
+}
+
+_open_project_inner() {
+  local p="${1:-}"
+  if [ -n "$p" ]; then
+    check_name "$p"
+    proot-distro login ubuntu -- bash -lc "cd '/root/projects/$p' 2>/dev/null || { echo 'project not found: $p'; exit 2; }; exec /root/.opencode/bin/opencode"
+  else
+    proot-distro login ubuntu -- bash -lc "cd /root/projects; exec /root/.opencode/bin/opencode"
+  fi
+}
+
+open_project() {
+  start_gateway
+  local health
+  health="$(python "$PY" health --config "$CFG_FILE")"
+  python -c 'import json,sys; d=json.loads(sys.argv[1]); raise SystemExit(0 if d.get("ok") else 2)' "$health" || {
+    echo "no usable free route; add/fix a key or wait for cooldown" >&2
+    status_cmd >&2 || true
+    return 2
+  }
+  with_wakelock _open_project_inner "${1:-}"
+}
+
+doctor() {
+  need_installed
+  local bad=0
+  ok() { printf 'OK    %s\n' "$*"; }
+  warn() { printf 'WARN  %s\n' "$*"; }
+  fail() { printf 'FAIL  %s\n' "$*"; bad=1; }
+
+  command -v python >/dev/null 2>&1 && ok "Termux Python" || fail "Termux Python missing"
+  command -v proot-distro >/dev/null 2>&1 && ok "proot-distro" || fail "proot-distro missing"
+  [ -f "$CFG_FILE" ] && python "$PY" status --config "$CFG_FILE" >/dev/null 2>&1 \
+    && ok "mobile.json valid" || fail "mobile.json invalid"
+  if [ -f "$SECRETS_FILE" ] && python - "$SECRETS_FILE" <<'PY' >/dev/null 2>&1
+import os, sys
+p=sys.argv[1]
+raise SystemExit(0 if (os.stat(p).st_mode & 0o077) == 0 else 1)
+PY
+  then
+    ok "secrets permissions 0600"
+  else
+    fail "secrets file missing or permissions too open"
+  fi
+
+  if proot-distro login ubuntu -- /bin/true >/dev/null 2>&1; then
+    ok "Ubuntu proot"
+  else
+    fail "Ubuntu proot unavailable"
+  fi
+  local ocver major
+  ocver="$(proot-distro login ubuntu -- /root/.opencode/bin/opencode --version 2>/dev/null | head -1 | tr -d 'v[:space:]' || true)"
+  major="${ocver%%.*}"
+  if [[ "$major" =~ ^[0-9]+$ ]]; then
+    ok "OpenCode $ocver"
+  else
+    major=2
+    fail "OpenCode version unreadable"
+  fi
+  if proot-distro login ubuntu -- env OC_MAJOR="$major" python3 - <<'PY' >/dev/null 2>&1
+import json, os
+from pathlib import Path
+major=int(os.environ.get('OC_MAJOR') or 2)
+p=Path('/root/.config/opencode/opencode.json')
+cfg=json.loads(p.read_text())
+if major >= 2:
+    assert '@dietrichgebert/ponytail' in cfg.get('plugins', [])
+    assert 'ponytail-free' in cfg.get('providers', {})
+else:
+    assert '@dietrichgebert/ponytail' in cfg.get('plugin', [])
+    assert 'ponytail-free' in cfg.get('provider', {})
+assert cfg.get('model') == 'ponytail-free/free'
+t=Path('/root/.config/ponytail/gateway.token')
+assert t.exists() and t.read_text().strip()
+PY
+  then
+    ok "OpenCode Ponytail/free profile matches major version"
+  else
+    fail "OpenCode profile/token mismatch; rerun termux/install.sh"
+  fi
+
+  if start_gateway >/dev/null 2>&1 && python "$PY" health --config "$CFG_FILE" >/dev/null 2>&1; then
+    ok "localhost gateway responds"
+  else
+    fail "localhost gateway unavailable"
+  fi
+  local routes
+  routes="$(python "$PY" health --config "$CFG_FILE" 2>/dev/null || true)"
+  if [ -n "$routes" ] && python -c 'import json,sys; d=json.loads(sys.argv[1]); raise SystemExit(0 if d.get("ok") else 1)' "$routes"; then
+    ok "at least one usable free route"
+  else
+    warn "no usable route now (missing key or cooldown); run ptmobile status"
+  fi
+
+  [ "$bad" = 0 ] || return 1
+}
+
+case "${1:-}" in
+  key) key_cmd "${2:-}" ;;
+  rotate-token) rotate_token ;;
+  start) start_gateway; echo "gateway started" ;;
+  stop) stop_gateway; echo "gateway stopped" ;;
+  status) status_cmd ;;
+  discover) run_gateway_cmd discover ;;
+  doctor) doctor ;;
+  open) open_project "${2:-}" ;;
+  init)
+    check_name "${2:-}"
+    proot-distro login ubuntu -- bash -lc "mkdir -p '/root/projects/${2}' && cd '/root/projects/${2}' && { [ -d .git ] || git init -q -b main; }"
+    open_project "$2"
+    ;;
+  logs) touch "$LOG_FILE"; tail -n 80 -f "$LOG_FILE" ;;
+  "") status_cmd || true; echo; usage ;;
+  *) usage; exit 2 ;;
+esac

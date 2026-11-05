@@ -1,0 +1,42 @@
+{
+  "listen": "127.0.0.1",
+  "port": 8766,
+  "maxConcurrent": 2,
+  "providers": [
+    {
+      "id": "gemini",
+      "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "keyEnv": "GEMINI_API_KEY",
+      "priority": 10,
+      "models": [
+        "gemini-3.8-flash",
+        "gemini-3.6-flash",
+        "gemini-3.1-flash-lite"
+      ]
+    },
+    {
+      "id": "groq",
+      "baseURL": "https://api.groq.com/openai/v1",
+      "keyEnv": "GROQ_API_KEY",
+      "priority": 20,
+      "models": [
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.8-27b",
+        "openai/gpt-oss-20b"
+      ]
+    },
+    {
+      "id": "openrouter",
+      "baseURL": "https://openrouter.ai/api/v1",
+      "keyEnv": "OPENROUTER_API_KEY",
+      "priority": 30,
+      "freeGuard": "openrouter",
+      "models": [
+        "openrouter/free"
+      ],
+      "headers": {
+        "X-Title": "Ponytail Mobile"
+      }
+    }
+  ]
+}
